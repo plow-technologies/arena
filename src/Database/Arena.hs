@@ -138,6 +138,3 @@ startArena summerize finalize arenaFull diskLocation = liftIO $ do
       return $ OJ ai jh (pure . alec $ as) as
     alec :: [a] -> b
     alec = foldl1 (<>) . map summerize
-    dfToCIOa :: ArenaID -> IO (c, IO [a])
-    dfToCIOa a = do
-      return (undefined, readDataFl a)
