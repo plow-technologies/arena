@@ -4,6 +4,7 @@ module Database.Arena (
   , startArena
   ) where
 
+import Control.Applicative
 import Data.Word
 import Data.Maybe
 import Data.List
@@ -99,12 +100,13 @@ startArena summerize finalize arenaFull diskLocation = liftIO $ do
       putStrLn "Wish we could!"
     readDataFl :: MonadIO m => ArenaID -> m [a]
     readDataFl ai = liftIO $ do
-      d <- BS.readFile (dataFile diskLocation ai)
-      error "Alec, also do this."
+      d <- BSL.readFile (dataFile diskLocation ai)
+      return $ runGetL (many deserialize) d
     readJournalFl :: FilePath -> IO [a]
     readJournalFl jf = do
-      d <- BS.readFile jf
-      error "Alec, this is your job."
+      d <- BSL.readFile jf
+      return $ runGetL (many deserialize) d
+      -- return $ deserializeUncorrupted d
     internArenaFl :: ArenaID -> IO ()
     internArenaFl ai = do
       -- This has a problem if the journal was empty!
@@ -138,3 +140,6 @@ startArena summerize finalize arenaFull diskLocation = liftIO $ do
       return $ OJ ai jh (pure . alec $ as) as
     alec :: [a] -> b
     alec = foldl1 (<>) . map summerize
+    dfToCIOa :: ArenaID -> IO (c, IO [a])
+    dfToCIOa a = do
+      return (undefined, readDataFl a)
