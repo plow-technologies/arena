@@ -13,12 +13,15 @@ import Data.Bytes.Put
 import Data.Semigroup
 import Data.IORef
 import Control.Monad.Trans
+import Control.Monad
 import Control.Concurrent.MVar
 import Data.Digest.CRC32
 import System.IO
 import System.FilePath
 import System.Directory
 import qualified Data.ByteString as BS
+import qualified Data.ByteString.Lazy as BSL
+import qualified Data.Set as Set
 import Safe
 
 newtype ArenaLocation = ArenaLocation FilePath
@@ -65,7 +68,12 @@ startArena summerize finalize arenaFull diskLocation = liftIO $ do
     return (accessData dr currJournalM, addData dr currJournalM)
   where
     readAllData :: IO [(c, m2 [a])]
-    readAllData = undefined
+    readAllData = do
+      ds <- (Set.fromList . mapMaybe (readMay . dropExtension)) <$>
+                       (getDirectoryContents . dataDir $ diskLocation)
+      forM (Set.toList ds) $ \d -> do
+        c <- (runGetL deserialize) <$> (BSL.readFile . dataSummaryFile diskLocation $ d)
+        return (c, readDataFl d)
     accessData :: IORef [(c, m2 [a])] -> MVar (OpenJournal a b) -> m2 [(c, m2 [a])]
     accessData dr cjM = liftIO $ do
       withMVar cjM $ \(OJ _ _ s as) -> do
@@ -81,7 +89,7 @@ startArena summerize finalize arenaFull diskLocation = liftIO $ do
        True -> do
          hClose h
          internArenaFl ai
-         atomicModifyIORef' dsr $ \ods -> 
+         atomicModifyIORef' dsr $ \ods ->
            ((finalize . fromJust . getOption $ s, readDataFl ai):ods, ())
          let ai' = ai + 1
          h' <- openFile (arenaId2jfl diskLocation $ ai') WriteMode
