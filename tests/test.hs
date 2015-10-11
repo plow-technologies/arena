@@ -1,7 +1,10 @@
-{-# LANGUAGE TupleSections #-}
+{-# LANGUAGE ScopedTypeVariables, TupleSections #-}
 module Main where
 
-import Data.List.NonEmpty
+import System.Mem
+import Control.Concurrent
+
+import Data.List
 import Data.Semigroup
 import System.Directory
 import Database.Arena
@@ -24,7 +27,13 @@ main = do
   mapM_ addVal [(1::Int)..14]
   sm <- (sum . fmap fst) <$> getState
   as <- getState >>= mapM (\(c, act) -> (c,) <$> act)
-  putStrLn . show $ as
-  putStrLn . show $ sm
+  putStrLn . show . sort $ as
   assert (sm == (65 + sum [1..14])) "Larger sum incorrect!"
+  performMajorGC
+  threadDelay 100000
+  performMajorGC
+  (getState', _::Int -> IO ()) <- startArena ((1::Sum Int,) . Sum) (getSum . snd) ((5 <) . getSum . fst) (ArenaLocation "test_data")
+  as' <- getState' >>= mapM (\(c, act) -> (c,) <$> act)
+  putStrLn . show . sort $ as'
+  assert ((sort as) == (sort as')) "doesn't match old data"
   return ()

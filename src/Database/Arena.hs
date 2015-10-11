@@ -146,9 +146,8 @@ startArena summerize finalize arenaFull diskLocation = liftIO $ do
             mapM_ (BS.hPutStr h . runPutS . serialize . mkJournal . runPutS . serialize) as
             syncHandle h
           renameFile (tempJournal diskLocation) (arenaId2jfl diskLocation ai)
-          removeFile . tempJournal $ diskLocation
           jh <- openFile (arenaId2jfl diskLocation ai) WriteMode
-          return $ OJ ai jh (pure . alec $ as) as
+          return $ OJ ai jh (pure . alec $ as) (reverse as)
     alec :: [a] -> b
     alec = foldl1 (<>) . map summerize
     dfToCIOa :: ArenaID -> IO (c, IO [a])
