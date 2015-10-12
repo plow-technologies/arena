@@ -2,7 +2,20 @@
 {-# LANGUAGE RecordWildCards            #-}
 {-# LANGUAGE ScopedTypeVariables        #-}
 
-module Database.Arena where
+module Database.Arena
+    (
+     ArenaLocation(..)
+    , startArena
+
+    , ArenaT
+    , Arena
+    , runArenaT
+    , runArena
+    , addData
+    , accessData
+    )
+
+ where
 
 import           Control.Applicative
 import           Control.Concurrent.MVar
@@ -167,11 +180,11 @@ withFileSync fp f = liftIO $ withFile fp WriteMode go
   where go h = f h <* syncHandle h
 
 data ArenaConf summary finalized a = ArenaConf {
-      acSummarize :: a -> summary
-    , acFinalize  :: summary -> finalized
-    , acArenaFull :: summary -> Bool
-    , acArenaLocation :: ArenaLocation
-    , acDataRef   :: IORef [(finalized, IO [a])]
+      acSummarize      :: a -> summary
+    , acFinalize       :: summary -> finalized
+    , acArenaFull      :: summary -> Bool
+    , acArenaLocation  :: ArenaLocation
+    , acDataRef        :: IORef [(finalized, IO [a])]
     , acCurrentJournal :: MVar (OpenJournal a summary)
     }
 
