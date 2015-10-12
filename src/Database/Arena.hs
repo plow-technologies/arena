@@ -1,14 +1,13 @@
-{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE RecordWildCards            #-}
+{-# LANGUAGE ScopedTypeVariables        #-}
 
-module Database.Arena (
-    ArenaLocation(..)
-  , startArena
-  ) where
+module Database.Arena where
 
 import           Control.Applicative
 import           Control.Concurrent.MVar
 import           Control.Monad
+import           Control.Monad.Reader
 import           Control.Monad.Trans
 import           Data.Bytes.Get
 import           Data.Bytes.Put
@@ -164,5 +163,196 @@ syncHandle h = do
   putStrLn "NYI: syncHandle"
 
 withFileSync :: FilePath -> (Handle -> IO r) -> IO r
-withFileSync fp f = withFile fp WriteMode go
+withFileSync fp f = liftIO $ withFile fp WriteMode go
   where go h = f h <* syncHandle h
+
+data ArenaConf summary finalized a = ArenaConf {
+      acSummarize :: a -> summary
+    , acFinalize  :: summary -> finalized
+    , acArenaFull :: summary -> Bool
+    , acArenaLocation :: ArenaLocation
+    , acDataRef   :: IORef [(finalized, IO [a])]
+    , acCurrentJournal :: MVar (OpenJournal a summary)
+    }
+
+newtype ArenaT s f d m a = ArenaT { unArenaT :: ReaderT (ArenaConf s f d) m a }
+    deriving (Functor, Applicative, Monad, MonadTrans, MonadReader (ArenaConf s f d), MonadIO)
+
+summarize :: Monad m => d -> ArenaT s f d m s
+summarize d = asks acSummarize <*> pure d
+
+finalize :: Monad m => s -> ArenaT s f d m f
+finalize s = asks acFinalize <*> pure s
+
+-- journalDir, dataDir, tempJournal :: ArenaLocation -> FilePath
+-- journalFile, dataFile, dataSummaryFile :: ArenaLocation -> ArenaID -> FilePath
+
+data TheFiles = TheFiles {
+      theJournalDir
+    , theDataDir
+    , theTempJournal
+    , theJournalFile
+    , theDataFile
+    , theDataSummaryFile :: FilePath
+} deriving (Eq, Ord, Read, Show)
+
+theFiles :: Monad m => Maybe ArenaID -> ArenaT s f d m TheFiles
+theFiles Nothing   = theFiles (Just $ -1)
+theFiles (Just ai) =
+  TheFiles <$> journalDir'     <*> dataDir'     <*> tempJournal'
+           <*> journalFile' ai <*> dataFile' ai <*> dataSummaryFile' ai
+
+initArenaT
+  :: (MonadIO m, Serial d, Serial f, Semigroup s) => ArenaT s f d m a -> ArenaT s f d m a
+initArenaT at = do
+  cj <- internArenas >>= cleanJournal >>= liftIO . newMVar
+  dr <- readAllData  >>= liftIO . newIORef
+  let extend ac = ac { acCurrentJournal = cj, acDataRef = dr }
+  local extend at
+
+runArenaT
+ :: (MonadIO m, Serial d, Serial s, Serial f, Semigroup s)
+   => (d -> s) -> (s -> f) -> (s -> Bool) -> ArenaLocation -> ArenaT s f d m a -> m a
+runArenaT acSummarize acFinalize acArenaFull acArenaLocation at =
+    runReaderT (unArenaT $ initArenaT at) ArenaConf {..}
+      where acCurrentJournal = error "current journal not initialized"
+            acDataRef        = error "data ref not initialized"
+
+type Arena s f d a = ArenaT s f d IO a
+
+runArena
+  :: (Serial d, Serial s, Serial f, Semigroup s)
+    => (d -> s) -> (s -> f) -> (s -> Bool) -> ArenaLocation -> Arena s f d a -> IO a
+runArena = runArenaT
+
+tempJournal' :: Monad m => ArenaT s f d m FilePath
+tempJournal' = asks (tempJournal . acArenaLocation)
+
+journalFile' :: Monad m => ArenaID -> ArenaT s f d m FilePath
+journalFile' ai = asks (journalFile . acArenaLocation) <*> pure ai
+
+journalDir' :: Monad m => ArenaT s f d m FilePath
+journalDir' = asks (journalDir . acArenaLocation)
+
+dataDir' :: Monad m => ArenaT s f d m FilePath
+dataDir' = asks (dataDir . acArenaLocation)
+
+dataFile' :: Monad m => ArenaID -> ArenaT s f d m FilePath
+dataFile' ai = asks (dataFile . acArenaLocation) <*> pure ai
+
+dataSummaryFile' :: Monad m => ArenaID -> ArenaT s f d m FilePath
+dataSummaryFile' ai = asks (dataSummaryFile . acArenaLocation) <*> pure ai
+
+readJournalFile' :: (Serial d, MonadIO m) => ArenaID -> ArenaT s f d m [d]
+readJournalFile' ai = do
+  d <- journalFile' ai >>= liftIO . BSL.readFile
+  return . map (head . rights . pure . runGetS deserialize . jData) . runGetL (many deserialize) $ d
+
+
+cleanJournal :: (MonadIO m, Serial d, Semigroup s) => ArenaID -> ArenaT s f d m (OpenJournal d s)
+cleanJournal ai = do
+  TheFiles {..} <- theFiles (Just ai)
+  liftIO $ doesFileExist theTempJournal >>= (`when` removeFile theTempJournal)
+  je <- liftIO $ doesFileExist theJournalFile
+  case je of
+    False -> do
+     jh <- liftIO $ openFile theJournalFile WriteMode
+     return $ OJ ai jh (Option Nothing) []
+    True -> do
+      as <- readJournalFile' ai
+      liftIO $ withFileSync theTempJournal $ \h ->
+        mapM_ (BS.hPutStr h . runPutS . serialize . mkJournal) as
+      liftIO $ renameFile theTempJournal theJournalFile
+      jh <- liftIO $ openFile theJournalFile WriteMode
+      as' <- alec' as
+      return $ OJ ai jh (pure as') (reverse as)
+
+readArenaIDs :: MonadIO m => FilePath -> m [ArenaID]
+readArenaIDs dir = liftIO go
+    where go = mapMaybe readMay <$> getDirectoryContents dir
+
+internArenas :: (MonadIO m, Serial d, Serial f, Semigroup s) => ArenaT s f d m ArenaID
+internArenas = do
+  js <- journalDir' >>= readArenaIDs
+  if null js
+  then return 0
+  else do
+    let latest = maximum js
+        old    = delete latest js
+    mapM_ internArenaFile old
+    return latest
+
+alec' :: (Semigroup s, Monad m) => [d] -> ArenaT s f d m s
+alec' ds = foldl1 (<>) <$> traverse summarize ds
+
+internArenaFile :: (MonadIO m, Serial f, Serial d, Semigroup s) => ArenaID -> ArenaT s f d m ()
+internArenaFile ai = do
+  TheFiles {..} <- theFiles (Just ai)
+  as  <- readJournalFile' ai
+  fas <- alec' as >>= finalize
+  liftIO $ do withFileSync theDataFile  $ \h -> mapM_ (BS.hPutStr h . runPutS . serialize) as
+              withFileSync theDataSummaryFile $ \h -> BS.hPutStr h . runPutS . serialize $ fas
+              removeFile theJournalFile
+
+
+readDataFile' :: (MonadIO m, Serial d) => ArenaID -> ArenaT s f d m (IO [d])
+readDataFile' ai = asks (readDataFile . acArenaLocation) <*> pure ai
+
+readAllData :: (MonadIO m, Serial f, Serial d) => ArenaT s f d m [(f, IO [d])]
+readAllData = do
+  TheFiles {..} <- theFiles Nothing
+  ds <- Set.fromList . mapMaybe (readMay . dropExtension) <$> liftIO (getDirectoryContents theDataDir)
+  forM (Set.toList ds) $ \d -> do
+                dsf <- dataSummaryFile' d
+                c <- runGetL deserialize <$> liftIO (BSL.readFile dsf)
+                rdf <- readDataFile' d
+                return (c, rdf)
+
+-- accessData :: IORef [(c, m2 [a])] -> MVar (OpenJournal a b) -> m2 [(c, m2 [a])]
+-- accessData dr cjM = liftIO $ do
+--   withMVar cjM $ \(OJ _ _ s as) -> do
+--     d <- readIORef dr
+--     return $ (finalize . fromJust . getOption $ s, return . reverse $ as):d
+
+accessData :: MonadIO m => ArenaT s f d m [(f, IO [d])]
+accessData = do
+  ArenaConf {..} <- ask
+  liftIO . withMVar acCurrentJournal $ \(OJ _ _ s as) -> do
+               d <- readIORef acDataRef
+               return $ (acFinalize . fromJust . getOption $ s, return . reverse $ as) : d
+
+addData :: (MonadIO m, Serial d, Serial f, Semigroup s) => d -> ArenaT s f d m ()
+addData d = do
+  conf@ArenaConf {..} <- ask
+  liftIO . modifyMVar_ acCurrentJournal $ \(OJ ai h s ds) -> do
+              BS.hPutStr h . runPutS . serialize . mkJournal $ d
+              let s' = s <> (pure . acSummarize $ d)
+              syncHandle h
+              case acArenaFull . fromJust . getOption $ s' of
+                False -> return $ OJ ai h s' (d:ds)
+                True -> do
+                  hClose h
+                  let (ArenaT rdr) = internArenaFile ai -- :: Arena s f d ()
+                  runReaderT rdr conf
+                  atomicModifyIORef' acDataRef $ \ods ->
+                    ((acFinalize . fromJust . getOption $ s', readDataFile acArenaLocation ai):ods, ())
+                  let ai' = ai + 1
+                  h' <- openFile (journalFile acArenaLocation ai') WriteMode
+                  return $ OJ ai' h' mempty mempty
+
+
+-- addData :: IORef [(c, m2 [a])] -> MVar (OpenJournal a b) -> a -> m3 ()
+-- addData dsr ojM a = liftIO . modifyMVar_ ojM $ \(OJ ai h s as) -> do
+--  BS.hPutStr h . runPutS . serialize . mkJournal $ a
+--  let s' = s <> (pure . summarize $ a)
+--  syncHandle h -- This COULD be moved down for a very minor perf boost.
+--  case arenaFull . fromJust . getOption $ s' of
+--    False -> return $ OJ ai h s' (a:as)
+--    True -> do
+--      hClose h
+--      internArenaFl ai
+--      atomicModifyIORef' dsr $ \ods ->
+--        ((finalize . fromJust . getOption $ s', readDataFl ai):ods, ())
+--      let ai' = ai + 1
+--      h' <- openFile (journalFile diskLocation $ ai') WriteMode
+--      return $ OJ ai' h' mempty mempty
