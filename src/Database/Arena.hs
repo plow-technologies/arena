@@ -41,7 +41,7 @@ import           Safe
 import           System.Directory
 import           System.FilePath
 import           System.IO
-import           System.Posix.IO         (handleToFd)
+import           System.Posix.IO         (handleToFd, fdToHandle)
 import           System.Posix.Unistd     (fileSynchronise)
 
 newtype ArenaLocation = ArenaLocation { getArenaLocation :: FilePath }
@@ -78,14 +78,16 @@ readJournalFile l ai = do
   d <- BSL.readFile (journalFile l ai)
   return . map (head . rights . pure . runGetS deserialize . jData) . runGetL (many deserialize) $ d
 
-syncHandle :: Handle -> IO ()
+syncHandle :: Handle -> IO Handle
 syncHandle h = do
   hFlush h
-  fileSynchronise =<< handleToFd h
+  fd <- handleToFd h
+  fileSynchronise fd
+  fdToHandle fd
 
-withFileSync :: FilePath -> (Handle -> IO r) -> IO r
-withFileSync fp f = liftIO $ withFile fp WriteMode go
-  where go h = f h <* syncHandle h
+withFileSync :: FilePath -> (Handle -> IO ()) -> IO Handle
+withFileSync fp f = withFile fp WriteMode go
+  where go h = f h *> syncHandle h
 
 data ArenaConf summary finalized a = ArenaConf {
       acSummarize      :: a -> summary
@@ -177,7 +179,7 @@ cleanJournal ai = do
      return $ OJ ai jh (Option Nothing) []
     True -> do
       as <- readJournalFile' ai
-      liftIO $ withFileSync theTempJournal $ \h ->
+      _ <- liftIO $ withFileSync theTempJournal $ \h ->
         mapM_ (BS.hPutStr h . runPutS . serialize . mkJournal) as
       liftIO $ renameFile theTempJournal theJournalFile
       jh <- liftIO $ openFile theJournalFile WriteMode
@@ -238,11 +240,11 @@ addData d = do
   liftIO . modifyMVar_ acCurrentJournal $ \(OJ ai h s ds) -> do
               BS.hPutStr h . runPutS . serialize . mkJournal $ d
               let s' = s <> (pure . acSummarize $ d)
-              syncHandle h
+              sh <- syncHandle h
               case acArenaFull . fromJust . getOption $ s' of
-                False -> return $ OJ ai h s' (d:ds)
+                False -> return $ OJ ai sh s' (d:ds)
                 True -> do
-                  hClose h
+                  hClose sh
                   let (ArenaT rdr) = internArenaFile ai -- :: Arena s f d ()
                   runReaderT rdr conf
                   atomicModifyIORef' acDataRef $ \ods ->
