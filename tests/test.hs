@@ -28,9 +28,9 @@ prepDirectory = do
 main :: IO ()
 main = do
   prepDirectory
-  let go = runArena ((1,) . Sum) (getSum . snd) ((5 <) . getSum . fst) "test_data"
-  as <- go monadTest1
-  go $ monadTest2 as
+  tok <- startArena ((1,) . Sum) (getSum . snd) ((5 <) . getSum . fst) "test_data"
+  as <- runArena tok monadTest1
+  runArena tok $ monadTest2 as
 
 monadTest1 :: Arena (Sum Int, Sum Int) Int Int [(Int, [Int])]
 monadTest1 = do

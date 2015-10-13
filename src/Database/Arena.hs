@@ -8,6 +8,8 @@ module Database.Arena
 
     , ArenaT
     , Arena
+    , ArenaConf
+    , startArena
     , runArenaT
     , runArena
     , addData
@@ -144,19 +146,24 @@ initArenaT at = do
   let extend ac = ac { acCurrentJournal = cj, acDataRef = dr }
   local extend at
 
-runArenaT
- :: (MonadIO m, Serial d, Serial s, Serial f, Semigroup s)
-   => (d -> s) -> (s -> f) -> (s -> Bool) -> ArenaLocation -> ArenaT s f d m a -> m a
-runArenaT acSummarize acFinalize acArenaFull acArenaLocation at =
-    runReaderT (unArenaT $ initArenaT at) ArenaConf {..}
-      where acCurrentJournal = error "current journal not initialized"
-            acDataRef        = error "data ref not initialized"
+runArenaT :: ArenaConf s f d -> ArenaT s f d m a -> m a
+runArenaT ac = flip runReaderT ac . unArenaT
 
 type Arena s f d a = ArenaT s f d IO a
 
-runArena
+startArena
   :: (Serial d, Serial s, Serial f, Semigroup s)
-    => (d -> s) -> (s -> f) -> (s -> Bool) -> ArenaLocation -> Arena s f d a -> IO a
+    => (d -> s) -> (s -> f) -> (s -> Bool) -> ArenaLocation -> IO (ArenaConf s f d)
+startArena acSummarize acFinalize acArenaFull acArenaLocation =
+    runArena fakeConf $ do
+      acCurrentJournal <- internArenas >>= cleanJournal >>= liftIO . newMVar
+      acDataRef        <- readAllData  >>= liftIO . newIORef
+      return ArenaConf {..}
+    where fakeConf = ArenaConf { acCurrentJournal = error "uninitialized current journal"
+                               , acDataRef        = error "uninitialized data ref"
+                               , .. }
+
+runArena :: ArenaConf s f d -> Arena s f d a -> IO a
 runArena = runArenaT
 
 readJournalFile' :: (Serial d, MonadIO m) => ArenaID -> ArenaT s f d m [d]
