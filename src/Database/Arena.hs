@@ -41,6 +41,8 @@ import           Safe
 import           System.Directory
 import           System.FilePath
 import           System.IO
+import           System.Posix.IO         (handleToFd)
+import           System.Posix.Unistd     (fileSynchronise)
 
 newtype ArenaLocation = ArenaLocation { getArenaLocation :: FilePath }
   deriving (Eq, Ord, Read, Show, IsString)
@@ -79,7 +81,7 @@ readJournalFile l ai = do
 syncHandle :: Handle -> IO ()
 syncHandle h = do
   hFlush h
-  putStrLn "NYI: syncHandle"
+  fileSynchronise =<< handleToFd h
 
 withFileSync :: FilePath -> (Handle -> IO r) -> IO r
 withFileSync fp f = liftIO $ withFile fp WriteMode go
@@ -137,14 +139,6 @@ theFiles Nothing   = theFiles (Just $ -1)
 theFiles (Just ai) =
   TheFiles <$> journalDir'     <*> dataDir'     <*> tempJournal'
            <*> journalFile' ai <*> dataFile' ai <*> dataSummaryFile' ai
-
-initArenaT
-  :: (MonadIO m, Serial d, Serial f, Semigroup s) => ArenaT s f d m a -> ArenaT s f d m a
-initArenaT at = do
-  cj <- internArenas >>= cleanJournal >>= liftIO . newMVar
-  dr <- readAllData  >>= liftIO . newIORef
-  let extend ac = ac { acCurrentJournal = cj, acDataRef = dr }
-  local extend at
 
 runArenaT :: ArenaConf s f d -> ArenaT s f d m a -> m a
 runArenaT ac = flip runReaderT ac . unArenaT

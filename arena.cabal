@@ -28,6 +28,7 @@ library
       , directory
       , safe
       , containers
+      , unix
 
 test-suite test
   type: exitcode-stdio-1.0
