@@ -42,7 +42,18 @@ import           System.Directory
 import           System.FilePath
 import           System.IO
 import           System.Posix.IO         (handleToFd)
-import           System.Posix.Unistd     (fileSynchronise)
+import           System.Posix.Unistd     (fileSynchroniseDataOnly)
+import Data.Typeable (cast)
+import System.IO
+import System.IO.Error
+import GHC.IO.Exception
+import GHC.IO.Handle
+import GHC.IO.Handle.Types
+import GHC.IO.Handle.Internals
+import GHC.IO.Device
+import qualified GHC.IO.FD as FD
+import qualified GHC.IO.Handle.FD as FD
+import System.Posix.Types (Fd(Fd))
 
 newtype ArenaLocation = ArenaLocation { getArenaLocation :: FilePath }
   deriving (Eq, Ord, Read, Show, IsString)
@@ -80,8 +91,22 @@ readJournalFile l ai = do
 
 syncHandle :: Handle -> IO ()
 syncHandle h = do
-  hFlush h
-  fileSynchronise =<< handleToFd h
+    hFlush h
+    unsafeSyncHandle h
+  where
+    unsafeSyncHandle h@(DuplexHandle {}) =
+      ioError (ioeSetErrorString (mkIOError IllegalOperation
+                                  "unsafeSyncHandle" (Just h) Nothing)
+               "unsafeSyncHandle only works on file descriptors")
+    unsafeSyncHandle h@(FileHandle _ m) = do
+      withMVar m $ \h_@Handle__{haType=_,..} -> do
+        case cast haDevice of
+          Nothing -> ioError (ioeSetErrorString (mkIOError IllegalOperation
+                                                 "unsafeSyncHandle" (Just h) Nothing)
+                              ("handle is not a file descriptor"))
+          Just fd -> do
+            flushWriteBuffer h_
+            fileSynchroniseDataOnly . Fd . FD.fdFD $ fd
 
 withFileSync :: FilePath -> (Handle -> IO r) -> IO r
 withFileSync fp f = liftIO $ withFile fp WriteMode go
