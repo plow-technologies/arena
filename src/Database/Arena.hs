@@ -41,8 +41,19 @@ import           Safe
 import           System.Directory
 import           System.FilePath
 import           System.IO
-import           System.Posix.IO         (handleToFd, fdToHandle)
-import           System.Posix.Unistd     (fileSynchronise)
+import           System.Posix.IO         (handleToFd)
+import           System.Posix.Unistd     (fileSynchroniseDataOnly)
+import Data.Typeable (cast)
+import System.IO
+import System.IO.Error
+import GHC.IO.Exception
+import GHC.IO.Handle
+import GHC.IO.Handle.Types
+import GHC.IO.Handle.Internals
+import GHC.IO.Device
+import qualified GHC.IO.FD as FD
+import qualified GHC.IO.Handle.FD as FD
+import System.Posix.Types (Fd(Fd))
 
 newtype ArenaLocation = ArenaLocation { getArenaLocation :: FilePath }
   deriving (Eq, Ord, Read, Show, IsString)
@@ -78,16 +89,28 @@ readJournalFile l ai = do
   d <- BSL.readFile (journalFile l ai)
   return . map (head . rights . pure . runGetS deserialize . jData) . runGetL (many deserialize) $ d
 
-syncHandle :: Handle -> IO Handle
+syncHandle :: Handle -> IO ()
 syncHandle h = do
-  hFlush h
-  fd <- handleToFd h
-  fileSynchronise fd
-  fdToHandle fd
+    hFlush h
+    unsafeSyncHandle h
+  where
+    unsafeSyncHandle h@(DuplexHandle {}) =
+      ioError (ioeSetErrorString (mkIOError IllegalOperation
+                                  "unsafeSyncHandle" (Just h) Nothing)
+               "unsafeSyncHandle only works on file descriptors")
+    unsafeSyncHandle h@(FileHandle _ m) = do
+      withMVar m $ \h_@Handle__{haType=_,..} -> do
+        case cast haDevice of
+          Nothing -> ioError (ioeSetErrorString (mkIOError IllegalOperation
+                                                 "unsafeSyncHandle" (Just h) Nothing)
+                              ("handle is not a file descriptor"))
+          Just fd -> do
+            flushWriteBuffer h_
+            fileSynchroniseDataOnly . Fd . FD.fdFD $ fd
 
-withFileSync :: FilePath -> (Handle -> IO ()) -> IO Handle
-withFileSync fp f = withFile fp WriteMode go
-  where go h = f h *> syncHandle h
+withFileSync :: FilePath -> (Handle -> IO r) -> IO r
+withFileSync fp f = liftIO $ withFile fp WriteMode go
+  where go h = f h <* syncHandle h
 
 data ArenaConf summary finalized a = ArenaConf {
       acSummarize      :: a -> summary
@@ -179,7 +202,7 @@ cleanJournal ai = do
      return $ OJ ai jh (Option Nothing) []
     True -> do
       as <- readJournalFile' ai
-      _ <- liftIO $ withFileSync theTempJournal $ \h ->
+      liftIO $ withFileSync theTempJournal $ \h ->
         mapM_ (BS.hPutStr h . runPutS . serialize . mkJournal) as
       liftIO $ renameFile theTempJournal theJournalFile
       jh <- liftIO $ openFile theJournalFile WriteMode
@@ -240,11 +263,11 @@ addData d = do
   liftIO . modifyMVar_ acCurrentJournal $ \(OJ ai h s ds) -> do
               BS.hPutStr h . runPutS . serialize . mkJournal $ d
               let s' = s <> (pure . acSummarize $ d)
-              sh <- syncHandle h
+              syncHandle h
               case acArenaFull . fromJust . getOption $ s' of
-                False -> return $ OJ ai sh s' (d:ds)
+                False -> return $ OJ ai h s' (d:ds)
                 True -> do
-                  hClose sh
+                  hClose h
                   let (ArenaT rdr) = internArenaFile ai -- :: Arena s f d ()
                   runReaderT rdr conf
                   atomicModifyIORef' acDataRef $ \ods ->
