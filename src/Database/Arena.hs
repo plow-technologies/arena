@@ -255,7 +255,9 @@ accessData = do
   ArenaConf {..} <- ask
   liftIO . withMVar acCurrentJournal $ \(OJ _ _ s as) -> do
                d <- readIORef acDataRef
-               return $ (acFinalize . fromJust . getOption $ s, return . reverse $ as) : d
+               return $ if null as
+                        then d
+                        else (acFinalize . fromJust . getOption $ s, return . reverse $ as) : d
 
 addData :: (MonadIO m, Serial d, Serial f, Semigroup s) => d -> ArenaT s f d m ()
 addData d = do
