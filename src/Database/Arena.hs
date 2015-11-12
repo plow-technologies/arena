@@ -16,7 +16,7 @@ module Database.Arena
     , accessData
     )
 
- where
+where
 
 import           Control.Applicative
 import           Control.Concurrent.MVar
@@ -36,24 +36,24 @@ import           Data.Maybe
 import           Data.Semigroup
 import qualified Data.Set                as Set
 import           Data.String
+import           Data.Typeable           (cast)
 import           Data.Word
+import           GHC.IO.Device
+import           GHC.IO.Exception
+import qualified GHC.IO.FD               as FD
+import           GHC.IO.Handle
+import qualified GHC.IO.Handle.FD        as FD
+import           GHC.IO.Handle.Internals
+import           GHC.IO.Handle.Types
 import           Safe
 import           System.Directory
 import           System.FilePath
 import           System.IO
+import           System.IO
+import           System.IO.Error
 import           System.Posix.IO         (handleToFd)
+import           System.Posix.Types      (Fd (Fd))
 import           System.Posix.Unistd     (fileSynchroniseDataOnly)
-import Data.Typeable (cast)
-import System.IO
-import System.IO.Error
-import GHC.IO.Exception
-import GHC.IO.Handle
-import GHC.IO.Handle.Types
-import GHC.IO.Handle.Internals
-import GHC.IO.Device
-import qualified GHC.IO.FD as FD
-import qualified GHC.IO.Handle.FD as FD
-import System.Posix.Types (Fd(Fd))
 
 newtype ArenaLocation = ArenaLocation { getArenaLocation :: FilePath }
   deriving (Eq, Ord, Read, Show, IsString)
