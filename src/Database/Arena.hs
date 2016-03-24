@@ -4,19 +4,17 @@
 
 module Database.Arena
     (
-     ArenaLocation(..)
+      ArenaLocation(..)
 
     , ArenaT
     , Arena
-    , ArenaConf
-    , startArena
+    , ArenaDB
     , runArenaT
     , runArena
+    , startArena, initArena
     , addData
     , accessData
-    )
-
-where
+    ) where
 
 import           Control.Applicative
 import           Control.Concurrent.MVar
@@ -30,6 +28,7 @@ import qualified Data.ByteString         as BS
 import qualified Data.ByteString.Lazy    as BSL
 import           Data.Digest.CRC32
 import           Data.Either
+import           Data.Foldable
 import           Data.IORef
 import           Data.List
 import           Data.Maybe
@@ -37,6 +36,7 @@ import           Data.Semigroup
 import qualified Data.Set                as Set
 import           Data.String
 import           Data.Typeable           (cast)
+import qualified Data.Vector.Persistent  as PV
 import           Data.Word
 import           GHC.IO.Device
 import           GHC.IO.Exception
@@ -46,22 +46,41 @@ import qualified GHC.IO.Handle.FD        as FD
 import           GHC.IO.Handle.Internals
 import           GHC.IO.Handle.Types
 import           Safe
-import           System.Directory
+import           System.Directory        hiding (listDirectory)
 import           System.FilePath
-import           System.IO
 import           System.IO
 import           System.IO.Error
 import           System.Posix.IO         (handleToFd)
 import           System.Posix.Types      (Fd (Fd))
 import           System.Posix.Unistd     (fileSynchroniseDataOnly)
 
+-- | directory >= 0.2.5.0 breaks a lot of packages
+-- | but directory < 0.2.5.0 does not contain the listDirectory function
+-- | copied the function for local use
+
+listDirectory :: FilePath -> IO [FilePath]
+listDirectory path =
+  (filter f) <$> (getDirectoryContents path)
+  where f filename = filename /= "." && filename /= ".."
+
+-- | The base directory for the arena files to be stored under.
 newtype ArenaLocation = ArenaLocation { getArenaLocation :: FilePath }
   deriving (Eq, Ord, Read, Show, IsString)
 
 type ArenaID     = Word32
 type JournalHash = Word32
 
-data JournalFrame = JF { jLength :: Word32, jHash :: JournalHash, jData :: BS.ByteString }
+data JournalFrame =
+    JF {
+      jLength :: Word32
+      -- ^ The amount of data stored in the frame.
+    , jHash :: JournalHash
+      -- ^ A hash of the data stored in the frame so we can detect write corruption.
+      --   This is sufficient for the entire frame as all other elements are fixed
+      --   size and directly impact the data's hash.
+    , jData :: BS.ByteString
+      -- ^ The user's serialized data.
+    }
 
 mkJournal :: Serial a => a -> JournalFrame
 mkJournal a = JF (fromIntegral . BS.length $ d) (crc32 d) d
@@ -77,17 +96,23 @@ instance Serial JournalFrame where
       then return $ JF l h d
       else fail "Journal Frame failed CRC check---Also, uh, this method shouldn't be in Monad"
 
-data OpenJournal a b = OJ { ojArenaID :: ArenaID, ojHandle :: Handle, ojSummary :: Option b, ojVals :: [a] }
+data OpenJournal a b =
+  OJ {
+    ojArenaID :: ArenaID
+    -- ^ The current datablock generation, starting from zero and strictly monotonic.
+  , ojHandle :: Handle
+    -- ^ The journal file, opened and positioned for writing
+  , ojSummary :: Option b
+    -- ^ The current summary, if any values have been stored in the journal
+  , ojVals :: PV.Vector a
+    -- ^ The values currently held in the journal on disk, in a 'PV.Vector' (instead of a list) to
+    --   improve GC performance, and provide fast snoc to avoid the use of reverse.
+  }
 
 readDataFile :: (MonadIO m, Serial a) => ArenaLocation -> ArenaID -> m [a]
 readDataFile l ai = liftIO $ do
   d <- BSL.readFile (dataFile l ai)
   return $ runGetL (many deserialize) d
-
-readJournalFile :: Serial a => ArenaLocation -> ArenaID -> IO [a]
-readJournalFile l ai = do
-  d <- BSL.readFile (journalFile l ai)
-  return . map (head . rights . pure . runGetS deserialize . jData) . runGetL (many deserialize) $ d
 
 syncHandle :: Handle -> IO ()
 syncHandle h = do
@@ -112,23 +137,42 @@ withFileSync :: FilePath -> (Handle -> IO r) -> IO r
 withFileSync fp f = liftIO $ withFile fp WriteMode go
   where go h = f h <* syncHandle h
 
-data ArenaConf summary finalized a = ArenaConf {
-      acSummarize      :: a -> summary
-    , acFinalize       :: summary -> finalized
-    , acArenaFull      :: summary -> Bool
-    , acArenaLocation  :: ArenaLocation
-    , acDataRef        :: IORef [(finalized, IO [a])]
-    , acCurrentJournal :: MVar (OpenJournal a summary)
+data ArenaDB summary finalized d = ArenaDB {
+      adSummarize      :: d -> summary
+      -- ^ Convert the user's data to an instance of the summary semigroup
+    , adFinalize       :: summary -> finalized
+      -- ^ Removal of data only used for the merge operation or determining fullness,
+      --   changing the summary to a version used purely for the datablock indexing.
+    , adArenaFull      :: summary -> Bool
+      -- ^ Determine if we've reached a datablock boundary.
+    , adArenaLocation  :: ArenaLocation
+      -- ^ The location on the filesystem in which we store the data and journal.
+    , adDataRef        :: IORef [(finalized, IO [d])]
+      -- ^ The list of datablocks, seen as their summary and accessors, for read operations.
+    , adCurrentJournal :: MVar (OpenJournal d summary)
+      -- ^ The journal for writing new data, in an 'MVar' so we can lock it for consistency when
+      --   doing writes or data access.
     }
 
-newtype ArenaT s f d m a = ArenaT { unArenaT :: ReaderT (ArenaConf s f d) m a }
-    deriving (Functor, Applicative, Monad, MonadTrans, MonadReader (ArenaConf s f d), MonadIO)
+-- | * @s@: The summary semigroup for the journal data.
+--   * @f@: The finalized summary associated with a datablock.
+--   * @d@: The user's datatype stored in the arena.
+newtype ArenaT s f d m a = ArenaT { unArenaT :: ReaderT (ArenaDB s f d) m a }
+    deriving (Functor, Applicative, Monad, MonadTrans, MonadReader (ArenaDB s f d), MonadIO)
+
+runArenaT :: ArenaDB s f d -> ArenaT s f d m a -> m a
+runArenaT ad = flip runReaderT ad . unArenaT
+
+type Arena s f d a = ArenaT s f d IO a
+
+runArena :: ArenaDB s f d -> Arena s f d a -> IO a
+runArena = runArenaT
 
 summarize :: Monad m => d -> ArenaT s f d m s
-summarize d = asks acSummarize <*> pure d
+summarize d = asks adSummarize <*> pure d
 
 finalize :: Monad m => s -> ArenaT s f d m f
-finalize s = asks acFinalize <*> pure s
+finalize s = asks adFinalize <*> pure s
 
 journalDir, dataDir, tempJournal :: ArenaLocation -> FilePath
 journalDir (ArenaLocation fp) = fp            </> "journal"
@@ -141,14 +185,14 @@ dataFile        al i = dataDir    al </> addExtension (show i) "data"
 dataSummaryFile al i = dataDir    al </> addExtension (show i) "header"
 
 journalDir', dataDir', tempJournal' :: Monad m => ArenaT s f d m FilePath
-journalDir'  = asks (journalDir  . acArenaLocation)
-dataDir'     = asks (dataDir     . acArenaLocation)
-tempJournal' = asks (tempJournal . acArenaLocation)
+journalDir'  = asks (journalDir  . adArenaLocation)
+dataDir'     = asks (dataDir     . adArenaLocation)
+tempJournal' = asks (tempJournal . adArenaLocation)
 
 journalFile', dataFile', dataSummaryFile' :: Monad m => ArenaID -> ArenaT s f d m FilePath
-journalFile'     ai = asks (journalFile     . acArenaLocation) <*> pure ai
-dataFile'        ai = asks (dataFile        . acArenaLocation) <*> pure ai
-dataSummaryFile' ai = asks (dataSummaryFile . acArenaLocation) <*> pure ai
+journalFile'     ai = asks (journalFile     . adArenaLocation) <*> pure ai
+dataFile'        ai = asks (dataFile        . adArenaLocation) <*> pure ai
+dataSummaryFile' ai = asks (dataSummaryFile . adArenaLocation) <*> pure ai
 
 data TheFiles = TheFiles {
       theJournalDir
@@ -165,30 +209,35 @@ theFiles (Just ai) =
   TheFiles <$> journalDir'     <*> dataDir'     <*> tempJournal'
            <*> journalFile' ai <*> dataFile' ai <*> dataSummaryFile' ai
 
-runArenaT :: ArenaConf s f d -> ArenaT s f d m a -> m a
-runArenaT ac = flip runReaderT ac . unArenaT
+-- | Setup the directory structure for Arena.
+--   This is performed implicitly by 'startArena'.
+initArena :: ArenaLocation -> IO ()
+initArena al = do
+  createDirectoryIfMissing True . journalDir $ al
+  createDirectoryIfMissing True . dataDir $ al
 
-type Arena s f d a = ArenaT s f d IO a
-
+-- | Launch an 'ArenaDB', using the given summarizing, finalizing, and block policy functions,
+--   at the given 'ArenaLocation'.
+--
+--   __NB:__ Two 'ArenaDB's must not be run concurrently with a shared 'ArenaLocation'.
+--   Data loss from the journal is likely to result.
 startArena
-  :: (Serial d, Serial s, Serial f, Semigroup s)
-    => (d -> s) -> (s -> f) -> (s -> Bool) -> ArenaLocation -> IO (ArenaConf s f d)
-startArena acSummarize acFinalize acArenaFull acArenaLocation =
+  :: (Serial d, Serial f, Semigroup s)
+    => (d -> s) -> (s -> f) -> (s -> Bool) -> ArenaLocation -> IO (ArenaDB s f d)
+startArena adSummarize adFinalize adArenaFull adArenaLocation = do
+    initArena adArenaLocation
     runArena fakeConf $ do
-      acCurrentJournal <- internArenas >>= cleanJournal >>= liftIO . newMVar
-      acDataRef        <- readAllData  >>= liftIO . newIORef
-      return ArenaConf {..}
-    where fakeConf = ArenaConf { acCurrentJournal = error "uninitialized current journal"
-                               , acDataRef        = error "uninitialized data ref"
+      adCurrentJournal <- internArenas >>= cleanJournal >>= liftIO . newMVar
+      adDataRef        <- readAllData  >>= liftIO . newIORef
+      return ArenaDB {..}
+    where fakeConf = ArenaDB { adCurrentJournal = error "uninitialized current journal"
+                               , adDataRef        = error "uninitialized data ref"
                                , .. }
 
-runArena :: ArenaConf s f d -> Arena s f d a -> IO a
-runArena = runArenaT
-
-readJournalFile' :: (Serial d, MonadIO m) => ArenaID -> ArenaT s f d m [d]
-readJournalFile' ai = do
+readJournalFile :: (Serial d, MonadIO m) => ArenaID -> ArenaT s f d m (PV.Vector d)
+readJournalFile ai = do
   d <- journalFile' ai >>= liftIO . BSL.readFile
-  return . map (head . rights . pure . runGetS deserialize . jData) . runGetL (many deserialize) $ d
+  return . PV.fromList . map (head . rights . pure . runGetS deserialize . jData) . runGetL (many deserialize) $ d
 
 
 cleanJournal :: (MonadIO m, Serial d, Semigroup s) => ArenaID -> ArenaT s f d m (OpenJournal d s)
@@ -199,19 +248,21 @@ cleanJournal ai = do
   case je of
     False -> do
      jh <- liftIO $ openFile theJournalFile WriteMode
-     return $ OJ ai jh (Option Nothing) []
+     return $ OJ ai jh (Option Nothing) mempty
     True -> do
-      as <- readJournalFile' ai
+      as <- readJournalFile ai
       liftIO $ withFileSync theTempJournal $ \h ->
         mapM_ (BS.hPutStr h . runPutS . serialize . mkJournal) as
       liftIO $ renameFile theTempJournal theJournalFile
-      jh <- liftIO $ openFile theJournalFile WriteMode
-      as' <- alec' as
-      return $ OJ ai jh (pure as') (reverse as)
+      jh <- liftIO $ openFile theJournalFile AppendMode
+      as' <- if null as
+            then return $ Option Nothing
+            else Option . Just <$> regenerateSummary as
+      return $ OJ ai jh as' as
 
 readArenaIDs :: MonadIO m => FilePath -> m [ArenaID]
 readArenaIDs dir = liftIO go
-    where go = mapMaybe readMay <$> getDirectoryContents dir
+    where go = mapMaybe readMay <$> listDirectory dir
 
 internArenas :: (MonadIO m, Serial d, Serial f, Semigroup s) => ArenaT s f d m ArenaID
 internArenas = do
@@ -224,56 +275,65 @@ internArenas = do
     mapM_ internArenaFile old
     return latest
 
-alec' :: (Semigroup s, Monad m) => [d] -> ArenaT s f d m s
-alec' ds = foldl1 (<>) <$> traverse summarize ds
+regenerateSummary :: (Semigroup s, Monad m) => PV.Vector d -> ArenaT s f d m s
+regenerateSummary ds = foldl1 (<>) <$> traverse summarize ds
 
 internArenaFile :: (MonadIO m, Serial f, Serial d, Semigroup s) => ArenaID -> ArenaT s f d m ()
 internArenaFile ai = do
   TheFiles {..} <- theFiles (Just ai)
-  as  <- readJournalFile' ai
-  fas <- alec' as >>= finalize
+  as  <- readJournalFile ai
+  fas <- regenerateSummary as >>= finalize
   liftIO $ do withFileSync theDataFile  $ \h -> mapM_ (BS.hPutStr h . runPutS . serialize) as
               withFileSync theDataSummaryFile $ \h -> BS.hPutStr h . runPutS . serialize $ fas
               removeFile theJournalFile
 
 
 readDataFile' :: (MonadIO m, Serial d) => ArenaID -> ArenaT s f d m (IO [d])
-readDataFile' ai = asks (readDataFile . acArenaLocation) <*> pure ai
+readDataFile' ai = asks (readDataFile . adArenaLocation) <*> pure ai
 
 readAllData :: (MonadIO m, Serial f, Serial d) => ArenaT s f d m [(f, IO [d])]
 readAllData = do
   TheFiles {..} <- theFiles Nothing
-  ds <- Set.fromList . mapMaybe (readMay . dropExtension) <$> liftIO (getDirectoryContents theDataDir)
+  ds <- Set.fromList . mapMaybe (readMay . dropExtension) <$> liftIO (listDirectory theDataDir)
   forM (Set.toList ds) $ \d -> do
                 dsf <- dataSummaryFile' d
                 c <- runGetL deserialize <$> liftIO (BSL.readFile dsf)
                 rdf <- readDataFile' d
                 return (c, rdf)
 
+-- | Access an atomic snapshot of the 'ArenaDB' as a list of summaries and accessors
+--   for their associated data. One datablock is the journal, and thus does not satisfy
+--   the block policy.
+--
+--   The returned IO actions in the list provide access to a state consistent with the time
+--   when the list of accessors was returned, but do not hold more then the journal at that
+--   time's contents in memory.
 accessData :: MonadIO m => ArenaT s f d m [(f, IO [d])]
 accessData = do
-  ArenaConf {..} <- ask
-  liftIO . withMVar acCurrentJournal $ \(OJ _ _ s as) -> do
-               d <- readIORef acDataRef
+  ArenaDB {..} <- ask
+  liftIO . withMVar adCurrentJournal $ \(OJ _ _ s as) -> do
+               d <- readIORef adDataRef
                return $ if null as
                         then d
-                        else (acFinalize . fromJust . getOption $ s, return . reverse $ as) : d
+                        else (adFinalize . fromJust . getOption $ s, return . toList $ as) : d
 
+-- | Durably insert a piece of data into the 'ArenaDB'.
+--   This funtion returns after the data is sync'd to disk.
 addData :: (MonadIO m, Serial d, Serial f, Semigroup s) => d -> ArenaT s f d m ()
 addData d = do
-  conf@ArenaConf {..} <- ask
-  liftIO . modifyMVar_ acCurrentJournal $ \(OJ ai h s ds) -> do
+  conf@ArenaDB {..} <- ask
+  liftIO . modifyMVar_ adCurrentJournal $ \(OJ ai h s ds) -> do
               BS.hPutStr h . runPutS . serialize . mkJournal $ d
-              let s' = s <> (pure . acSummarize $ d)
+              let s' = s <> (pure . adSummarize $ d)
               syncHandle h
-              case acArenaFull . fromJust . getOption $ s' of
-                False -> return $ OJ ai h s' (d:ds)
+              case adArenaFull . fromJust . getOption $ s' of
+                False -> return $ OJ ai h s' (ds `PV.snoc` d)
                 True -> do
                   hClose h
                   let (ArenaT rdr) = internArenaFile ai -- :: Arena s f d ()
                   runReaderT rdr conf
-                  atomicModifyIORef' acDataRef $ \ods ->
-                    ((acFinalize . fromJust . getOption $ s', readDataFile acArenaLocation ai):ods, ())
+                  atomicModifyIORef' adDataRef $ \ods ->
+                    ((adFinalize . fromJust . getOption $ s', readDataFile adArenaLocation ai):ods, ())
                   let ai' = ai + 1
-                  h' <- openFile (journalFile acArenaLocation ai') WriteMode
+                  h' <- openFile (journalFile adArenaLocation ai') WriteMode
                   return $ OJ ai' h' mempty mempty
