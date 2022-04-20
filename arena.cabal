@@ -1,5 +1,6 @@
 name:                arena
-version:             0.1
+version:             0.2
+x-revision: 1
 synopsis:            A journaled data store
 license:             BSD3
 license-file:        LICENSE
@@ -18,7 +19,7 @@ description:
 
 source-repository head
   type: git
-  location: http://git.xkrd.net/distributed-systems/arena
+  location: http://git.xkrd.net/distributed-systems/arena.git
 
 library
   hs-source-dirs:      src
@@ -33,7 +34,7 @@ library
       , mtl >= 2.2
       , bytes >= 0.14
       , digest >= 0.0.1.2
-      , directory
+      , directory >= 1.2.5.0
       , safe >= 0.3
       , containers >= 0.5.4.0
       , unix >= 2.7.1.0

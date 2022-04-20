@@ -1,3 +1,5 @@
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE RecordWildCards            #-}
 {-# LANGUAGE ScopedTypeVariables        #-}
@@ -46,22 +48,15 @@ import qualified GHC.IO.Handle.FD        as FD
 import           GHC.IO.Handle.Internals
 import           GHC.IO.Handle.Types
 import           Safe
-import           System.Directory        hiding (listDirectory)
+import           System.Directory
 import           System.FilePath
 import           System.IO
 import           System.IO.Error
 import           System.Posix.IO         (handleToFd)
 import           System.Posix.Types      (Fd (Fd))
 import           System.Posix.Unistd     (fileSynchroniseDataOnly)
-
--- | directory >= 0.2.5.0 breaks a lot of packages
--- | but directory < 0.2.5.0 does not contain the listDirectory function
--- | copied the function for local use
-
-listDirectory :: FilePath -> IO [FilePath]
-listDirectory path =
-  (filter f) <$> (getDirectoryContents path)
-  where f filename = filename /= "." && filename /= ".."
+import           GHC.Generics            (Generic)
+import           Data.Coerce             (coerce)
 
 -- | The base directory for the arena files to be stored under.
 newtype ArenaLocation = ArenaLocation { getArenaLocation :: FilePath }
@@ -158,7 +153,7 @@ data ArenaDB summary finalized d = ArenaDB {
 --   * @f@: The finalized summary associated with a datablock.
 --   * @d@: The user's datatype stored in the arena.
 newtype ArenaT s f d m a = ArenaT { unArenaT :: ReaderT (ArenaDB s f d) m a }
-    deriving (Functor, Applicative, Monad, MonadTrans, MonadReader (ArenaDB s f d), MonadIO)
+    deriving (Functor, Applicative, Monad, MonadTrans, MonadReader (ArenaDB s f d), MonadIO, MonadFail)
 
 runArenaT :: ArenaDB s f d -> ArenaT s f d m a -> m a
 runArenaT ad = flip runReaderT ad . unArenaT
@@ -337,3 +332,85 @@ addData d = do
                   let ai' = ai + 1
                   h' <- openFile (journalFile adArenaLocation ai') WriteMode
                   return $ OJ ai' h' mempty mempty
+
+-- Compat with base 4.16
+-- | 'Option' is effectively 'Maybe' with a better instance of
+-- 'Monoid', built off of an underlying 'Semigroup' instead of an
+-- underlying 'Monoid'.
+--
+-- Ideally, this type would not exist at all and we would just fix the
+-- 'Monoid' instance of 'Maybe'.
+--
+-- In GHC 8.4 and higher, the 'Monoid' instance for 'Maybe' has been
+-- corrected to lift a 'Semigroup' instance instead of a 'Monoid'
+-- instance. Consequently, this type is no longer useful. It will be
+-- marked deprecated in GHC 8.8 and removed in GHC 8.10.
+newtype Option a = Option { getOption :: Maybe a }
+  deriving ( Eq       -- ^ @since 4.9.0.0
+           , Ord      -- ^ @since 4.9.0.0
+           , Show     -- ^ @since 4.9.0.0
+           , Read     -- ^ @since 4.9.0.0
+           , Generic  -- ^ @since 4.9.0.0
+           )
+
+-- | @since 4.9.0.0
+instance Functor Option where
+  fmap f (Option a) = Option (fmap f a)
+
+-- | @since 4.9.0.0
+instance Applicative Option where
+  pure a = Option (Just a)
+  Option a <*> Option b = Option (a <*> b)
+  liftA2 f (Option x) (Option y) = Option (liftA2 f x y)
+
+  Option Nothing  *>  _ = Option Nothing
+  _               *>  b = b
+
+-- | @since 4.9.0.0
+instance Monad Option where
+  Option (Just a) >>= k = k a
+  _               >>= _ = Option Nothing
+  (>>) = (*>)
+
+-- | @since 4.9.0.0
+instance Alternative Option where
+  empty = Option Nothing
+  Option Nothing <|> b = b
+  a <|> _ = a
+
+-- | @since 4.9.0.0
+instance MonadPlus Option
+
+-- | @since 4.9.0.0
+instance MonadFix Option where
+  mfix f = Option (mfix (getOption . f))
+
+-- | @since 4.9.0.0
+instance Foldable Option where
+  foldMap f (Option (Just m)) = f m
+  foldMap _ (Option Nothing)  = mempty
+
+-- | @since 4.9.0.0
+instance Traversable Option where
+  traverse f (Option (Just a)) = Option . Just <$> f a
+  traverse _ (Option Nothing)  = pure (Option Nothing)
+
+-- | Fold an 'Option' case-wise, just like 'maybe'.
+option :: b -> (a -> b) -> Option a -> b
+option n j (Option m) = maybe n j m
+
+-- | @since 4.9.0.0
+instance Semigroup a => Semigroup (Option a) where
+  (<>) = coerce ((<>) :: Maybe a -> Maybe a -> Maybe a)
+#if !defined(__HADDOCK_VERSION__)
+    -- workaround https://github.com/haskell/haddock/issues/680
+  stimes _ (Option Nothing) = Option Nothing
+  stimes n (Option (Just a)) = case compare n 0 of
+    LT -> errorWithoutStackTrace "stimes: Option, negative multiplier"
+    EQ -> Option Nothing
+    GT -> Option (Just (stimes n a))
+#endif
+
+-- | @since 4.9.0.0
+instance Semigroup a => Monoid (Option a) where
+  mempty = Option Nothing
