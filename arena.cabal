@@ -1,5 +1,5 @@
 name:                arena
-version:             0.2
+version:             0.2.1
 x-revision: 1
 synopsis:            A journaled data store
 license:             BSD3
