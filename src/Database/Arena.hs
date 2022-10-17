@@ -333,7 +333,7 @@ addData d = do
                   h' <- openFile (journalFile adArenaLocation ai') WriteMode
                   return $ OJ ai' h' mempty mempty
 
-#if MIN_VERSION_base(4,16)
+#if MIN_VERSION_base(4,16,0)
 -- Compat with base 4.16
 -- | 'Option' is effectively 'Maybe' with a better instance of
 -- 'Monoid', built off of an underlying 'Semigroup' instead of an
