@@ -118,7 +118,7 @@ addAndQueryData :: LogArena ()
 addAndQueryData = do
   mapM_ addData [LogEntry (show $ n `mod` 23) n ((n * n - 1) `mod` 29)
                      | n <- [1..7000]] -- sufficiently random looking data
-  46666 <- queryBytesServed 2345 5678
+  _ <- queryBytesServed 2345 5678
   return ()
 
 -- | Make the database in @/tmp@ and go!
